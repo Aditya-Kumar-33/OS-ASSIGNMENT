@@ -1,0 +1,293 @@
+#include <stdio.h>
+#include <elf.h>
+#include <string.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <assert.h>
+#include <sys/types.h>
+#include <sys/mman.h>
+#include <signal.h>
+#include <stdint.h>
+#include <math.h>
+
+Elf32_Ehdr *ehdr; // Elf32_Ehdr structure represents the ELF header and ehdr is pointer to it
+Elf32_Phdr *phdr;
+int fd;
+int page_faults = 0;
+// to  keep a  track of  no of segmentation faults
+
+typedef int (*startFunctionPtr)();
+startFunctionPtr new_start;
+int termination_flag = 0;
+// to keep a track when the process has  finished executing;
+
+// initializing a linked list
+struct node
+{
+    unsigned int memory_size;
+    unsigned int intitial_va;
+    unsigned int current_va;
+    struct memory *mem;
+    Elf32_Phdr *segment;
+    int page_alloted;
+    struct node *next;
+};
+
+struct node *head = NULL;
+
+// create new node
+struct node *CreateNode(Elf32_Phdr *temp_ph)
+{
+    struct node *newnode = (struct node *)malloc(sizeof(struct node));
+    newnode->memory_size = temp_ph->p_memsz;
+    newnode->intitial_va = temp_ph->p_vaddr;
+    newnode->page_alloted = 0;
+    newnode->mem = NULL;
+    newnode->segment = temp_ph;
+    newnode->next = head;
+    head = newnode;
+    return newnode;
+}
+
+struct node *FindNode(Elf32_Phdr *temp)
+{
+    struct node *current = head;
+
+    while (current != NULL)
+    {
+        if (current->segment->p_vaddr == temp->p_vaddr)
+        {
+            return current; // Node found
+        }
+        current = current->next;
+    }
+    return NULL; // Node not found
+}
+
+struct memory
+{
+    void *mem;
+    struct memory *next;
+};
+
+// add new memory to node of segment as page allocation happens
+void AddMemory(struct memory *head, void *mem)
+{
+
+    struct memory *newNode = (struct memory *)malloc(sizeof(struct memory));
+    if (newNode == NULL)
+    {
+        printf("Memory allocation failed.\n");
+        exit(1);
+    }
+
+    newNode->mem = mem;
+    newNode->next = NULL;
+
+    if (head == NULL)
+    {
+        head = newNode;
+    }
+    else
+    {
+
+        struct memory *current = head;
+        while (current->next != NULL)
+        {
+            current = current->next;
+        }
+        current->next = newNode;
+    }
+}
+
+// unmap and clean all memory
+void FreeMemory(struct memory *head)
+{
+    while (head != NULL)
+    {
+        struct memory *temp = head;
+        head = head->next;
+        if (munmap(temp->mem, 4096) == -1)
+        {
+            perror("munmap failed");
+        }
+        free(temp);
+    }
+}
+
+void loader_cleanup()
+{
+
+    struct node *current = head;
+    printf("segment number of page = %d\n", current->page_alloted);
+    printf("segment mem size = %d\n", current->memory_size);
+
+    while (current != NULL)
+    {
+        struct node *temp = current;
+        current = current->next;
+        FreeMemory(temp->mem);
+        free(temp);
+    }
+
+    free(ehdr);
+    close(fd);
+}
+
+void load_and_run_elf(char **exe)
+{
+    fd = open(exe[1], O_RDONLY); // Open the ELF file specified in the first element of the 'exe' array
+
+    if (fd < 0) // file handling error
+    {
+        perror("error in opening file");
+        assert(fd != -1);
+        return;
+    }
+
+    ehdr = (Elf32_Ehdr *)malloc(sizeof(Elf32_Ehdr)); // ELF header
+    if (ehdr == NULL)
+    {
+        perror("malloc failed for ehdr");
+        exit(1);
+    }
+
+    assert(ehdr != NULL); // error handling for malloc
+
+    read(fd, ehdr, sizeof(Elf32_Ehdr)); // to read ELF header data from a fd into pointer ehdr
+
+    new_start = ehdr->e_entry;
+    // initialized our typecasted address to e_entry
+    // likely to generate error since no segment loaded
+    // this segmentation fault will caught by our handler
+
+    int result = new_start();
+
+    printf("User _start return value = %d\n", result);
+    printf("--------------------------------------\n");
+    printf("Number of Page_faults:%d\n", page_faults);
+}
+
+void handleSegmentationFault(void *segmentation_address)
+{
+    unsigned int entry = ehdr->e_entry;
+    // entry asigned to e_entry from elf header pointer ehdr
+    if (segmentation_address != NULL)
+    {
+        entry = segmentation_address;
+        // this sets entry to segmentation address which caused the page fault
+        // entry is just a variable
+    }
+
+    unsigned int phoff = ehdr->e_phoff;         // segment offset
+    unsigned short ph_size = ehdr->e_phentsize; // segment size
+    unsigned short ph_num = ehdr->e_phnum;      // total number of segments
+
+    phdr = (Elf32_Phdr *)((char *)ehdr + ehdr->e_phoff);
+
+    Elf32_Phdr *temp_ph = (Elf32_Phdr *)malloc(sizeof(Elf32_Phdr));
+    // assigning a temp variable  to  iterate among phdrs
+
+    if (temp_ph == NULL)
+    {
+        perror("malloc allocation failed");
+        exit(1);
+    }
+
+    void *virtual_mem; // pointer void* is special type that can hold address of any data type, (generic pointer type)
+    // iterate as many times as number of segment
+    for (int i = 0; i < ph_num; i++)
+    {
+        lseek(fd, phoff + i * ph_size, SEEK_SET);
+        // this takes the filepointer to desired address
+        read(fd, temp_ph, sizeof(Elf32_Phdr));
+        // reads certain bytes from the file
+
+        unsigned int vaddr = temp_ph->p_vaddr;
+        unsigned int memsz = temp_ph->p_memsz;
+
+        if (temp_ph->p_type == 1)
+        {
+            if (entry >= vaddr && entry <= (vaddr + memsz))
+            {
+
+                struct node *nodefound = FindNode(temp_ph);
+
+                if (nodefound == NULL)
+                {
+                    nodefound = CreateNode(temp_ph);
+                }
+
+                unsigned int mem_to_allocate = 4096; // 4KB page size
+
+                unsigned int address_to_allocate = nodefound->intitial_va + nodefound->page_alloted * 4096;
+
+                void *virtual_mem = mmap(address_to_allocate, mem_to_allocate, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANONYMOUS | MAP_PRIVATE, fd, 0);
+
+                if (virtual_mem == MAP_FAILED)
+                {
+                    perror("mmap failed");
+                    return;
+                }
+
+                nodefound->page_alloted++;
+                nodefound->current_va = address_to_allocate;
+                AddMemory(nodefound->mem, virtual_mem);
+
+                lseek(fd, temp_ph->p_offset, SEEK_SET);
+                read(fd, virtual_mem, temp_ph->p_filesz);
+
+                break;
+            }
+        }
+    }
+}
+
+static void my_handler(int signum, siginfo_t *info, void *context)
+{
+    page_faults++;
+
+    //  to keep a count of no of pagefaults
+
+    if (signum == SIGSEGV)
+    {
+
+        void *segmentation_address = (void *)info->si_addr; // this passes the address which caused the segmentation error
+        handleSegmentationFault(segmentation_address);
+    }
+}
+
+int main(int argc, char **argv)
+{
+
+    // do error handling for argv  etc
+
+    struct sigaction sig;
+    memset(&sig, 0, sizeof(sig));
+    sig.sa_handler = my_handler;
+    sig.sa_flags = SA_SIGINFO;
+
+    if (sigaction(SIGSEGV, &sig, NULL) == -1) // checking if sigaction returns -1, handle any errors in setting the signal handler
+    {
+        perror("sigaction error");
+        return 1;
+    }
+
+    // 1. carry out necessary checks on the input ELF file
+    if (argc != 2)
+    {
+        printf("Usage: %s <ELF Executable> \n", argv[0]);
+        exit(1);
+    }
+
+    // 2. passing it to the loader for carrying out the loading/execution
+    load_and_run_elf(argv);
+
+    printf("loaded successfully \n");
+
+    // 3. invoke the cleanup routine inside the loader
+    loader_cleanup();
+
+    return 0;
+}

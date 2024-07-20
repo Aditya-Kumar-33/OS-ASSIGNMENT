@@ -1,0 +1,2 @@
+Command: ./a, pid: 429, Execution time: 0.204, Waiting time: -0.204
+Command: ./final, pid: 432, Execution time: 0.166, Waiting time: -0.166

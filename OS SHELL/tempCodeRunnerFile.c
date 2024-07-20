@@ -1,0 +1,1 @@
+status = launch(command);
